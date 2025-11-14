@@ -1,0 +1,316 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import pickle
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import lightgbm as lgb
+from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+import warnings
+warnings.filterwarnings('ignore')
+
+# 设置中文字体
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+class TshirtSalesPredictor:
+    """新T恤月度销量预测器"""
+    
+    def __init__(self, data_path, model_save_path='models'):
+        """
+        初始化预测器
+        :param data_path: 数据文件夹路径
+        :param model_save_path: 模型保存路径
+        """
+        self.data_path = data_path
+        self.model_save_path = model_save_path
+        os.makedirs(self.model_save_path, exist_ok=True)
+        
+        # 初始化模型和预处理组件
+        self.model = None
+        self.preprocessor = None
+        self.selected_num_features = None
+        self.cat_features = None
+        self.test_rmse = None  # 用于计算置信区间
+    
+    def load_and_merge_data(self):
+        """加载并合并产品、销售、流量和天气数据"""
+        print("加载数据...")
+        # 读取数据（适配实际数据格式，可根据业务调整字段名）
+        product_df = pd.read_csv(os.path.join(self.data_path, 'product_attr.csv'))
+        sales_df = pd.read_csv(os.path.join(self.data_path, 'sales_data.csv'))
+        traffic_df = pd.read_csv(os.path.join(self.data_path, 'traffic_data.csv'))
+        weather_df = pd.read_csv(os.path.join(self.data_path, 'weather_data.csv'))
+        
+        # 数据合并（以商品ID和日期为关联键）
+        df = sales_df.merge(product_df, on='商品ID', how='left')
+        df = df.merge(traffic_df, on=['商品ID', '日期'], how='left')
+        df = df.merge(weather_df, on='日期', how='left')
+        
+        # 日期格式转换
+        df['日期'] = pd.to_datetime(df['日期'])
+        return df
+    
+    def preprocess_data(self, df):
+        """数据清洗与特征工程"""
+        print("数据预处理...")
+        # 1. 缺失值处理
+        df['日销量'] = df['日销量'].fillna(0)  # 销量缺失填充0
+        df['UV'] = df.groupby('商品ID')['UV'].transform(
+            lambda x: x.fillna(x.mean())
+        )  # 流量缺失用商品均值填充
+        df['气温'] = df.groupby(df['日期'].dt.month)['气温'].transform(
+            lambda x: x.fillna(x.mean())
+        )  # 气温缺失用同月均值填充
+        
+        # 2. 异常值处理（剔除销量>99分位的异常值）
+        df = df[df['日销量'] <= df.groupby('商品ID')['日销量'].transform(
+            lambda x: x.quantile(0.99)
+        )]
+        
+        # 3. 构建时间特征
+        df = df.sort_values(['商品ID', '日期'])
+        df['月份'] = df['日期'].dt.month
+        df['周次'] = df['日期'].dt.isocalendar().week
+        df['季节标签'] = df['月份'].apply(
+            lambda x: 0 if x in [3,4,5] else 1 if x in [6,7,8] else 2 if x in [9,10,11] else 3
+        )  # 0=春,1=夏,2=秋,3=冬
+        
+        # 4. 构建历史销售特征（前7天/30天平均销量）
+        df['前7日平均销量'] = df.groupby('商品ID')['日销量'].transform(
+            lambda x: x.rolling(window=7, min_periods=1).mean()
+        )
+        df['前30日平均销量'] = df.groupby('商品ID')['日销量'].transform(
+            lambda x: x.rolling(window=30, min_periods=1).mean()
+        )
+        
+        # 5. 构建流量转化特征
+        df['加购率'] = df['加购数'] / (df['UV'] + 1e-7)  # 避免除零
+        df['收藏率'] = df['收藏数'] / (df['UV'] + 1e-7)
+        
+        # 6. 特征筛选（基于相关性）
+        num_features = [
+            '定价', 'UV', '加购数', '收藏数', '气温',
+            '前7日平均销量', '前30日平均销量', '加购率', '收藏率'
+        ]
+        target = '日销量'
+        corr = df[num_features + [target]].corr()[target].abs()
+        self.selected_num_features = corr[corr >= 0.1].index.tolist()  # 保留相关系数≥0.1的特征
+        if target in self.selected_num_features:
+            self.selected_num_features.remove(target)
+        
+        # 7. 类别特征定义
+        self.cat_features = [
+            '款式', '颜色', '材质', '图案', 
+            '是否促销日', '是否节假日', '季节标签'
+        ]
+        
+        # 8. 时间序列划分（按时间顺序，避免未来数据泄露）
+        df['日期序号'] = df['日期'].rank(method='dense').astype(int)  # 日期转为序号
+        train_threshold = int(df['日期序号'].max() * 0.8)
+        val_threshold = int(df['日期序号'].max() * 0.9)
+        
+        train_df = df[df['日期序号'] <= train_threshold]
+        val_df = df[(df['日期序号'] > train_threshold) & (df['日期序号'] <= val_threshold)]
+        test_df = df[df['日期序号'] > val_threshold]
+        
+        # 9. 特征预处理管道（数值特征标准化，类别特征One-Hot编码）
+        self.preprocessor = ColumnTransformer(
+            transformers=[
+                ('num', StandardScaler(), self.selected_num_features),
+                ('cat', OneHotEncoder(drop='first', sparse_output=False), self.cat_features)
+            ])
+        
+        # 提取特征和标签
+        X_train = self.preprocessor.fit_transform(train_df[self.selected_num_features + self.cat_features])
+        y_train = train_df[target].values
+        X_val = self.preprocessor.transform(val_df[self.selected_num_features + self.cat_features])
+        y_val = val_df[target].values
+        X_test = self.preprocessor.transform(test_df[self.selected_num_features + self.cat_features])
+        y_test = test_df[target].values
+        
+        print(f"数据划分完成: 训练集{len(X_train)}条, 验证集{len(X_val)}条, 测试集{len(X_test)}条")
+        return X_train, y_train, X_val, y_val, X_test, y_test
+    
+    def train_model(self, X_train, y_train, X_val, y_val):
+        """训练LightGBM模型并调优"""
+        print("模型训练与调优...")
+        # 时间序列交叉验证（避免打乱时间顺序）
+        tscv = TimeSeriesSplit(n_splits=5)
+        
+        # 参数网格（根据业务数据规模调整）
+        param_grid = {
+            'n_estimators': [100, 150, 200],
+            'max_depth': [3, 4, 5],
+            'learning_rate': [0.05, 0.1],
+            'num_leaves': [31, 63],
+            'subsample': [0.8, 0.9]
+        }
+        
+        # 初始化模型
+        lgb_model = lgb.LGBMRegressor(
+            objective='regression',
+            metric='rmse',
+            random_state=42,
+            n_jobs=-1
+        )
+        
+        # 网格搜索调优
+        grid_search = GridSearchCV(
+            estimator=lgb_model,
+            param_grid=param_grid,
+            cv=tscv,
+            scoring='neg_mean_squared_error',
+            n_jobs=-1,
+            verbose=1
+        )
+        
+        # 训练并早停（避免过拟合）
+        grid_search.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            early_stopping_rounds=20,
+            verbose=False
+        )
+        
+        # 最佳模型
+        self.model = grid_search.best_estimator_
+        print(f"最佳参数: {grid_search.best_params_}")
+        print(f"验证集最优RMSE: {np.sqrt(-grid_search.best_score_):.2f}")
+        
+        # 保存模型
+        with open(os.path.join(self.model_save_path, 'lgb_sales_model.pkl'), 'wb') as f:
+            pickle.dump(self.model, f)
+        with open(os.path.join(self.model_save_path, 'preprocessor.pkl'), 'wb') as f:
+            pickle.dump(self.preprocessor, f)
+        print(f"模型已保存至{self.model_save_path}")
+        return self.model
+    
+    def evaluate_model(self, X_test, y_test):
+        """评估模型性能并可视化结果"""
+        print("模型评估...")
+        # 预测
+        y_pred = self.model.predict(X_test)
+        
+        # 计算指标
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        mae = mean_absolute_error(y_test, y_pred)
+        r2 = r2_score(y_test, y_pred)
+        self.test_rmse = rmse
+        
+        print(f"测试集性能:")
+        print(f"RMSE: {rmse:.2f}件 (预测误差)")
+        print(f"MAE: {mae:.2f}件 (平均绝对误差)")
+        print(f"R²: {r2:.2f} (模型解释度)")
+        
+        # 可视化预测vs实际（前30天）
+        plt.figure(figsize=(12, 6))
+        plt.plot(range(min(30, len(y_test))), y_test[:30], label='实际销量', color='#3498db', linewidth=2)
+        plt.plot(range(min(30, len(y_pred))), y_pred[:30], label='预测销量', color='#e74c3c', linewidth=2, linestyle='--')
+        plt.xlabel('日期')
+        plt.ylabel('日销量（件）')
+        plt.title('销量预测 vs 实际销量（前30天）')
+        plt.legend()
+        plt.grid(alpha=0.3)
+        plt.savefig('sales_prediction_vs_actual.png', dpi=150)
+        plt.close()
+        print("预测趋势图已保存为sales_prediction_vs_actual.png")
+        
+        # 特征重要性可视化
+        feature_names = self.selected_num_features + list(
+            self.preprocessor.transformers_[1][1].get_feature_names_out(self.cat_features)
+        )
+        importances = self.model.feature_importances_
+        importance_df = pd.DataFrame({
+            '特征': feature_names,
+            '重要性': importances
+        }).sort_values('重要性', ascending=False)
+        
+        plt.figure(figsize=(10, 6))
+        plt.barh(importance_df['特征'][:10], importance_df['重要性'][:10], color='#2ecc71')
+        plt.xlabel('特征重要性得分')
+        plt.ylabel('特征名称')
+        plt.title('Top10影响销量的关键特征')
+        plt.gca().invert_yaxis()
+        plt.savefig('feature_importance.png', dpi=150)
+        plt.close()
+        print("特征重要性图已保存为feature_importance.png")
+        
+        return rmse, mae, r2
+    
+    def predict_new_tshirt(self, new_tshirt_features):
+        """预测新T恤的月度销量"""
+        if self.model is None:
+            # 加载已保存的模型
+            self.model = pickle.load(open(os.path.join(self.model_save_path, 'lgb_sales_model.pkl'), 'rb'))
+            self.preprocessor = pickle.load(open(os.path.join(self.model_save_path, 'preprocessor.pkl'), 'rb'))
+        
+        # 转换新T恤特征为DataFrame
+        new_df = pd.DataFrame([new_tshirt_features])
+        
+        # 特征预处理
+        X_new = self.preprocessor.transform(new_df[self.selected_num_features + self.cat_features])
+        
+        # 预测单日销量并扩展到月度（30天）
+        daily_sales = self.model.predict(X_new)[0]
+        monthly_sales = daily_sales * 30
+        
+        # 计算95%置信区间（基于测试集误差）
+        if self.test_rmse is None:
+            self.test_rmse = 15  # 若未评估，使用默认误差值
+        daily_error = self.test_rmse
+        monthly_error = daily_error * np.sqrt(30)  # 月度误差=日误差×√30（独立样本误差叠加）
+        lower_bound = monthly_sales - 1.96 * monthly_error
+        upper_bound = monthly_sales + 1.96 * monthly_error
+        
+        # 确保销量非负
+        monthly_sales = max(0, round(monthly_sales))
+        lower_bound = max(0, round(lower_bound))
+        upper_bound = max(0, round(upper_bound))
+        
+        print("\n===== 新T恤月度销量预测结果 =====")
+        print(f"预测销量: {monthly_sales}件")
+        print(f"95%置信区间: [{lower_bound}件, {upper_bound}件]")
+        return monthly_sales, lower_bound, upper_bound
+
+
+# 主函数：执行训练和预测流程
+if __name__ == '__main__':
+    # 初始化预测器（数据路径需替换为实际路径）
+    predictor = TshirtSalesPredictor(data_path='./tshirt_sales_data')
+    
+    # 1. 加载并预处理数据
+    raw_df = predictor.load_and_merge_data()
+    X_train, y_train, X_val, y_val, X_test, y_test = predictor.preprocess_data(raw_df)
+    
+    # 2. 训练模型
+    predictor.train_model(X_train, y_train, X_val, y_val)
+    
+    # 3. 评估模型
+    predictor.evaluate_model(X_test, y_test)
+    
+    # 4. 预测新T恤销量（示例：夏季圆领印花棉T恤）
+    new_tshirt = {
+        # 数值特征（根据实际商品填写）
+        '定价': 99,               # 售价99元
+        'UV': 1200,               # 预计日均访问量1200
+        '加购数': 250,             # 预计日均加购250
+        '收藏数': 180,             # 预计日均收藏180
+        '气温': 29,                # 预计月度平均气温29℃
+        '前7日平均销量': 60,       # 参考同类商品前7天平均销量
+        '前30日平均销量': 55,      # 参考同类商品前30天平均销量
+        '加购率': 250/1200,        # 加购数/UV
+        '收藏率': 180/1200,        # 收藏数/UV
+        
+        # 类别特征（根据实际商品填写）
+        '款式': '圆领',            # 圆领/POLO领/连帽
+        '颜色': '白色',            # 白色/黑色/灰色/彩色
+        '材质': '棉',              # 棉/棉混纺/化纤
+        '图案': '印花',            # 纯色/印花/条纹
+        '是否促销日': 1,           # 1=有促销，0=无促销
+        '是否节假日': 0,           # 1=包含节假日，0=无
+        '季节标签': 1              # 1=夏季（6-8月）
+    }
+    pred, lower, upper = predictor.predict_new_tshirt(new_tshirt)
